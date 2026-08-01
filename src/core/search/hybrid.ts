@@ -706,23 +706,24 @@ export interface HybridSearchOpts extends SearchOpts {
 
 /**
  * v0.42.20.0 (Fix 3, #1775) — bound the query-time embed so a stalled provider
- * (the user's zeroentropy case) fails over to keyword instead of hanging past
- * the CLI's 10s force-exit. Default 6s leaves headroom under that deadline.
+ * fails over to keyword instead of hanging indefinitely. Local bge-m3 CPU
+ * inference can exceed 6s on a memory-pressured host, so the default allows a
+ * 30s recovery window while callers can still tighten it via the environment.
  */
 const QUERY_EMBED_TIMEOUT_MS = (() => {
   const n = Number(process.env.GBRAIN_QUERY_EMBED_TIMEOUT_MS);
-  return Number.isFinite(n) && n > 0 ? n : 6_000;
+  return Number.isFinite(n) && n > 0 ? n : 30_000;
 })();
 
 /**
  * Floor for the remaining shared-deadline budget at each embed call (codex).
  * The shared deadline is absolute from `hybridSearchCached` entry, so slow
- * expansion/keyword (or a 6s cache-lookup stall) before the inner embed could
+ * expansion/keyword (or a cache-lookup stall) before the inner embed could
  * leave ~0 budget and starve a HEALTHY embed into a false keyword-only result.
  * Flooring guarantees every embed gets at least this long, so a fast healthy
- * embed (~0.5s) always succeeds. Worst case under a stalled provider on the
- * cache-miss path: cache-lookup (6s) + inner floor (2s) = 8s, still under the
- * 10s CLI force-exit.
+ * embed (~0.5s) always succeeds. Under a stalled provider on the cache-miss
+ * path, the cache lookup consumes the configured deadline and the inner call
+ * receives only this 2s floor rather than a second full deadline.
  */
 const MIN_QUERY_EMBED_BUDGET_MS = 2_000;
 
@@ -767,6 +768,14 @@ export async function embedQueryBounded(
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function summarizeForSearchLog(value: string, maxChars: number): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  const bounded = compact.length > maxChars
+    ? `${compact.slice(0, Math.max(0, maxChars - 1))}…`
+    : compact;
+  return JSON.stringify(bounded);
 }
 
 export async function hybridSearch(
@@ -1207,13 +1216,14 @@ export async function hybridSearch(
     // the global default. Empty embeddingModel falls back to gateway
     // default — preserves pre-v0.36 behavior for the builtin 'embedding'
     // column.
+    const queryEmbedStartedAt = Date.now();
     try {
       const embedOpts = resolvedCol.embeddingModel
         ? { embeddingModel: resolvedCol.embeddingModel, dimensions: resolvedCol.dimensions }
         : undefined;
       // v0.42.20.0 (Fix 3) — bound the query embed. Reuse the shared deadline
       // threaded from hybridSearchCached (so the cache-lookup embed + this one
-      // share one ~6s budget); direct callers get a fresh deadline. On timeout
+      // share one deadline); direct callers get a fresh deadline. On timeout
       // the embed throws → the catch below falls back to keyword-only.
       const embedDl = opts?._queryEmbedDeadline ?? makeQueryEmbedDeadline();
       const embeddings = await Promise.all(queries.map(q => embedQueryBounded(q, embedOpts, embedDl)));
@@ -1231,8 +1241,17 @@ export async function hybridSearch(
       if (effectiveModality === 'both' && imageVectorList !== null) {
         vectorLists = [...vectorLists, imageVectorList];
       }
-    } catch {
-      // Embedding failure is non-fatal, fall back to keyword-only
+    } catch (err) {
+      // Embedding failure is non-fatal, but the fallback must be observable:
+      // otherwise a permanently unhealthy vector arm is indistinguishable
+      // from a healthy keyword-only result set.
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[gbrain search] query embedding failed; keyword-only fallback `
+        + `query=${summarizeForSearchLog(query, 96)} `
+        + `elapsed_ms=${Date.now() - queryEmbedStartedAt} `
+        + `reason=${summarizeForSearchLog(reason, 160)}`,
+      );
     }
   }
 
@@ -1642,7 +1661,8 @@ export async function hybridSearchCached(
   // opts._queryEmbedDeadline). On a stalled provider the cache-lookup embed
   // times out (→ cacheStatus 'disabled', fall through), then the inner embed
   // sees the already-elapsed budget and fails fast → keyword fallback. Worst
-  // case ~one timeout (~6s), comfortably under the CLI 10s force-exit.
+  // case ~one configured timeout plus the 2s floor, rather than two full
+  // timeout windows.
   const queryEmbedDl = makeQueryEmbedDeadline();
   if (!skipCache) {
     try {
