@@ -1597,16 +1597,17 @@ export class PGLiteEngine implements BrainEngine {
   /**
    * v0.32.7 CJK keyword fallback. PGLite's `websearch_to_tsquery('english')`
    * can't tokenize CJK so the FTS path returns empty for Chinese / Japanese /
-   * Korean queries. This routes to an ILIKE substring scan with
-   * bigram-frequency-count ranking as a ts_rank substitute.
+   * Korean queries. This routes to an ILIKE term scan with occurrence-count
+   * ranking as a ts_rank substitute. Whitespace-delimited query terms use AND
+   * semantics but may occur on different lines inside the same chunk.
    *
    * Codex outside-voice C8 corrections in place:
-   *   - Two distinct parameter bindings: $qLike (LIKE-escaped, for ILIKE) and
-   *     $qRaw (un-escaped, for ranking arithmetic via position/replace).
-   *     Escaped chars cannot be reused as ranking substrings.
-   *   - Explicit `ESCAPE '\'` on the ILIKE clause.
-   *   - Symmetric: no asymmetric whitespace strip (caller's query and
-   *     chunk_text are compared as-stored).
+   *   - Two distinct parameter bindings per term: LIKE-escaped for ILIKE and
+   *     raw for ranking arithmetic via position/replace. Escaped chars cannot
+   *     be reused as ranking substrings.
+   *   - Explicit `ESCAPE '\'` on every ILIKE clause.
+   *   - Whitespace is query syntax only; each non-empty term is matched
+   *     literally against chunk_text.
    *   - Empty-query guard returns no results without binding SQL.
    *
    * Postgres engine is intentionally untouched (multi-tenant deployments
@@ -1627,18 +1628,32 @@ export class PGLiteEngine implements BrainEngine {
     },
   ): Promise<SearchResult[]> {
     const { limit, offset, innerLimit, sourceFactorCase, hardExcludeClause, visibilityClause, detailFilter, opts, dedup } = ctx;
-    const qRaw = query;
-    if (qRaw.length === 0) return [];
-    const qLike = escapeLikePattern(qRaw);
-
-    // $1 = qLike (escaped for ILIKE)
-    // $2 = qRaw  (raw for position()/replace() ranking arithmetic)
-    // $3 = inner limit (dedup path) OR final limit (chunk-grain path)
-    // $4 = final limit (dedup path only) — see callers
-    // $5 = offset (dedup path)  /  $4 = offset (chunk-grain path)
-    const params: unknown[] = dedup
-      ? [qLike, qRaw, innerLimit, limit, offset]
-      : [qLike, qRaw, limit, offset];
+    const terms = [...new Set(query.trim().split(/\s+/u).filter(Boolean))];
+    if (terms.length === 0) return [];
+    const params: unknown[] = [];
+    const termFilters: string[] = [];
+    const occurrenceScores: string[] = [];
+    const positionScores: string[] = [];
+    for (const term of terms) {
+      params.push(escapeLikePattern(term));
+      const likeParam = `$${params.length}`;
+      params.push(term);
+      const rawParam = `$${params.length}`;
+      termFilters.push(`cc.chunk_text ILIKE '%' || ${likeParam} || '%' ESCAPE '\\'`);
+      occurrenceScores.push(`
+        (LENGTH(cc.chunk_text) - LENGTH(REPLACE(cc.chunk_text, ${rawParam}, ''))) / NULLIF(LENGTH(${rawParam}), 0)::real
+      `);
+      positionScores.push(`1.0 / NULLIF(POSITION(${rawParam} IN cc.chunk_text), 0)::real`);
+    }
+    params.push(dedup ? innerLimit : limit);
+    const innerOrLimitParam = `$${params.length}`;
+    let finalLimitParam = innerOrLimitParam;
+    if (dedup) {
+      params.push(limit);
+      finalLimitParam = `$${params.length}`;
+    }
+    params.push(offset);
+    const offsetParam = `$${params.length}`;
 
     let extraFilter = '';
     if (opts?.language) {
@@ -1666,15 +1681,22 @@ export class PGLiteEngine implements BrainEngine {
       extraFilter += ` AND p.source_id = $${params.length}`;
     }
 
-    // Bigram-frequency count: count occurrences of $qRaw in chunk_text via
-    // (length(chunk) - length(replace(chunk, q, ''))) / length(q). Acts as
-    // a ts_rank substitute. position()-tiebreaker so earlier-in-chunk hits
-    // outrank later ones at the same occurrence count.
+    // Count occurrences of every raw term in chunk_text via
+    // (length(chunk) - length(replace(chunk, term, ''))) / length(term).
+    // Multi-term searches normalize frequency by chunk length so a compact
+    // structured fact outranks a long report that repeats one generic term.
+    // Single-term searches preserve their historical frequency ranking.
+    // position()-tiebreakers favor earlier matches in both cases.
+    const occurrenceAverage = `((${occurrenceScores.join(' + ')}) / ${terms.length}.0)`;
+    const positionAverage = `((${positionScores.join(' + ')}) / ${terms.length}.0)`;
+    const termScore = terms.length === 1
+      ? `${occurrenceAverage} + ${positionAverage}`
+      : `${occurrenceAverage} * 100.0 / GREATEST(LENGTH(cc.chunk_text), 1) + ${positionAverage}`;
     const scoreExpr = `
-      ((LENGTH(cc.chunk_text) - LENGTH(REPLACE(cc.chunk_text, $2, ''))) / NULLIF(LENGTH($2), 0)::real
-        + 1.0 / NULLIF(POSITION($2 IN cc.chunk_text), 0)::real)
+      (${termScore})
       * ${sourceFactorCase}
     `;
+    const termFilter = termFilters.join(' AND ');
 
     if (dedup) {
       const { rows } = await this.db.query(
@@ -1690,15 +1712,15 @@ export class PGLiteEngine implements BrainEngine {
            FROM content_chunks cc
            JOIN pages p ON p.id = cc.page_id
            JOIN sources s ON s.id = p.source_id
-           WHERE cc.chunk_text ILIKE '%' || $1 || '%' ESCAPE '\\' ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+           WHERE ${termFilter} ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
              AND cc.modality = 'text'
            ORDER BY score DESC
-           LIMIT $3
+           LIMIT ${innerOrLimitParam}
          ),
          ${buildBestPerPagePoolCte('ranked')}
          SELECT * FROM best_per_page
          ORDER BY score DESC, page_id ASC, chunk_id ASC
-         LIMIT $4 OFFSET $5`,
+         LIMIT ${finalLimitParam} OFFSET ${offsetParam}`,
         params,
       );
       return (rows as Record<string, unknown>[]).map(rowToSearchResult);
@@ -1715,9 +1737,9 @@ export class PGLiteEngine implements BrainEngine {
          FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
          JOIN sources s ON s.id = p.source_id
-         WHERE cc.chunk_text ILIKE '%' || $1 || '%' ESCAPE '\\' ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+         WHERE ${termFilter} ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
          ORDER BY score DESC
-         LIMIT $3 OFFSET $4`,
+         LIMIT ${finalLimitParam} OFFSET ${offsetParam}`,
         params,
       );
       return (rows as Record<string, unknown>[]).map(rowToSearchResult);
