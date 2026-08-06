@@ -295,6 +295,54 @@ describe('PGLiteEngine: CJK keyword fallback (v0.32.7)', () => {
     expect(results[0].slug).toBe('originals/korean-essay');
   });
 
+  test('CJK query matches whitespace-separated terms across structured lines', async () => {
+    const slug = 'memory-axis/employee-facts-xinxin';
+    const chunk = '# 员工业务板块事实\n\n员工: 欣欣\n业务板块:\n- KOC媒介';
+    await engine.putPage(slug, {
+      type: 'reference', title: '员工业务板块事实', compiled_truth: chunk,
+    });
+    await engine.upsertChunks(slug, [
+      { chunk_index: 0, chunk_text: chunk, chunk_source: 'compiled_truth' },
+    ]);
+    const distractorSlug = 'reports/long-shared-board-observation';
+    const distractor = `欣欣参与了一次复盘。${'KOC媒介相关背景。'.repeat(12)}${'长篇观察。'.repeat(80)}`;
+    await engine.putPage(distractorSlug, {
+      type: 'note', title: '长篇观察', compiled_truth: distractor,
+    });
+    await engine.upsertChunks(distractorSlug, [
+      { chunk_index: 0, chunk_text: distractor, chunk_source: 'compiled_truth' },
+    ]);
+
+    const results = await engine.searchKeyword('欣欣 KOC媒介');
+
+    expect(results[0]?.slug).toBe(slug);
+  });
+
+  test('CJK query recalls every owner of a synthetic three-person shared board', async () => {
+    const slug = 'memory-axis/three-owner-shared-board';
+    const chunk = [
+      '# 三人共有业务板块事实',
+      '',
+      '员工:',
+      '- 甲木',
+      '- 乙木',
+      '- 丙木',
+      '业务板块:',
+      '- 三人共有板块',
+    ].join('\n');
+    await engine.putPage(slug, {
+      type: 'reference', title: '三人共有业务板块事实', compiled_truth: chunk,
+    });
+    await engine.upsertChunks(slug, [
+      { chunk_index: 0, chunk_text: chunk, chunk_source: 'compiled_truth' },
+    ]);
+
+    for (const employee of ['甲木', '乙木', '丙木']) {
+      const results = await engine.searchKeyword(`${employee} 三人共有板块`);
+      expect(results.map(result => result.slug)).toContain(slug);
+    }
+  });
+
   test('bigram ranking: 3-hit page outranks 1-hit page', async () => {
     // Add another Chinese page with only ONE occurrence of 测试.
     await engine.putPage('originals/chinese-one-hit', {
