@@ -20,21 +20,9 @@ import { join } from 'path';
 const LOCK_DIR_NAME = '.gbrain-lock';
 const LOCK_FILE = 'lock';
 
-// #2058: refresh the lock's `refreshed_at` while held so a long-running but
-// LIVE holder (embed jobs run for many minutes) is never mistaken for stale.
+// Refresh the lock's `refreshed_at` while held for operator observability.
+// Acquisition never uses heartbeat age to decide whether a holder is dead.
 const HEARTBEAT_INTERVAL_MS = 30_000;
-
-// #2058: a holder whose heartbeat refreshed within this window is ALIVE and is
-// NEVER stolen, regardless of how old the lock is. Only a holder that STOPPED
-// refreshing past this grace (hung, crashed without cleanup, or a PID since
-// reused by an unrelated process) is reaped. Pairing heartbeat-age with PID
-// liveness is what defeats both the WAL-corruption bug (stealing a live
-// writer) AND the PID-reuse false-positive (a recycled PID reading as "alive").
-// Env-overridable as an incident escape hatch, matching the sync-lock knobs.
-function stealGraceMs(): number {
-  const env = parseInt(process.env.GBRAIN_PGLITE_LOCK_STEAL_GRACE_SECONDS ?? '', 10);
-  return Number.isFinite(env) && env > 0 ? env * 1000 : 10 * 60 * 1000; // default 600s
-}
 
 export interface LockHandle {
   lockDir: string;
@@ -47,35 +35,50 @@ export interface LockHandle {
   heartbeat?: ReturnType<typeof setInterval>;
   lockPath?: string;
   /**
-   * #2058 (codex): our ownership token (`<pid>:<acquired_at>`). If we stall
-   * past the steal grace, another process can reap + re-acquire. When we
-   * resume, the heartbeat and release MUST verify the on-disk lock is STILL
-   * ours before touching it — otherwise a resumed stale holder would refresh
-   * or delete the NEW owner's live lock, re-opening the concurrent-writer hole.
+   * Our ownership token (`<pid>:<acquired_at>`). Heartbeat and release verify
+   * the on-disk lock is still ours before touching it so a stale handle cannot
+   * refresh or delete a replacement owner's lock.
    */
   ownerToken?: string;
 }
 
+interface LockRecord {
+  pid: number;
+  acquired_at: number;
+  refreshed_at?: number;
+  command?: unknown;
+}
+
 /** The on-disk lock identity, used to detect "we were reaped and replaced". */
-function tokenOf(lockData: { pid?: unknown; acquired_at?: unknown }): string {
+function tokenOf(lockData: Pick<LockRecord, 'pid' | 'acquired_at'>): string {
   return `${lockData.pid}:${lockData.acquired_at}`;
 }
 
+function readLockRecord(lockPath: string): LockRecord | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(lockPath, 'utf-8'));
+    if (typeof parsed !== 'object' || parsed === null) return undefined;
+    const record = parsed as Record<string, unknown>;
+    if (!Number.isSafeInteger(record.pid) || (record.pid as number) <= 0) return undefined;
+    if (!Number.isSafeInteger(record.acquired_at) || (record.acquired_at as number) <= 0) return undefined;
+    return record as unknown as LockRecord;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * #2058: keep the held lock's `refreshed_at` current so a concurrent acquirer
- * can tell a live, working holder from a hung/dead one. Best-effort: if the
- * file is gone (we're being reaped) the write simply fails. `.unref()` so the
- * timer never keeps the process alive on its own. Ownership-checked: if the
- * on-disk lock is no longer ours (we were reaped past grace and replaced), stop
- * the heartbeat instead of clobbering the new owner's lock.
+ * Keep the held lock's `refreshed_at` current for observability. Acquisition
+ * never uses heartbeat age to reap a live PID. Best-effort: if the record is
+ * unreadable or no longer ours, stop instead of clobbering another owner.
+ * `.unref()` ensures the timer never keeps the process alive on its own.
  */
 function startHeartbeat(lockPath: string, ownerToken: string): ReturnType<typeof setInterval> {
   const timer = setInterval(() => {
     try {
-      const raw = JSON.parse(readFileSync(lockPath, 'utf-8'));
-      if (tokenOf(raw) !== ownerToken) {
-        // We were reaped and someone else owns it now — do NOT refresh their
-        // lock. Stand down.
+      const raw = readLockRecord(lockPath);
+      if (!raw || tokenOf(raw) !== ownerToken) {
+        // Ownership is no longer certain — do not refresh this lock.
         clearInterval(timer);
         return;
       }
@@ -102,8 +105,10 @@ function isProcessAlive(pid: number): boolean {
     // Sending signal 0 checks existence without actually sending a signal
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    // ESRCH confirms the PID is gone. EPERM and unknown probe failures do not
+    // prove death, so keep the lock and fail closed.
+    return (error as NodeJS.ErrnoException)?.code !== 'ESRCH';
   }
 }
 
@@ -131,34 +136,22 @@ export async function acquireLock(dataDir: string | undefined, opts?: { timeoutM
     // Check for stale lock first
     if (existsSync(lockDir)) {
       const lockPath = join(lockDir, LOCK_FILE);
-      try {
-        const lockData = JSON.parse(readFileSync(lockPath, 'utf-8'));
-        const lockPid = lockData.pid as number;
-        const lockTime = lockData.acquired_at as number;
+      const lockData = readLockRecord(lockPath);
+      if (!lockData) {
+        // Missing, partially written, or malformed ownership is not evidence
+        // that no writer exists. Preserve the directory and fail closed.
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
 
-        // #2058: classify by PID liveness AND heartbeat freshness. A holder
-        // that is alive AND refreshed its heartbeat within the steal grace is
-        // genuinely working (e.g. a multi-minute embed) and is NEVER reaped —
-        // force-removing it here is what corrupted the single-writer WAL.
-        const alive = isProcessAlive(lockPid);
-        const lastRefresh = (lockData.refreshed_at as number | undefined) ?? lockTime;
-        const sinceRefresh = Date.now() - lastRefresh;
-        if (!alive) {
-          // Holder process is gone — reap.
-          try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* race condition, try again */ }
-        } else if (sinceRefresh > stealGraceMs()) {
-          // PID is alive but the heartbeat stopped past the grace window:
-          // either the holder hung, or this PID was reused by an unrelated
-          // process (the real holder died and stopped refreshing). Reap.
-          try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* race condition */ }
-        } else {
-          // Live holder refreshing within grace — wait and retry.
-          await new Promise(r => setTimeout(r, 1000));
-          continue;
-        }
-      } catch {
-        // Corrupt lock file — remove it
-        try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* race condition */ }
+      if (!isProcessAlive(lockData.pid)) {
+        // A valid record whose holder process is gone is safe to reap.
+        try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* race condition, try again */ }
+      } else {
+        // Heartbeats run on the JS event loop and can stop during synchronous
+        // PGLite/WASM work. A live PID is therefore never stolen automatically.
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
       }
     }
 
@@ -218,15 +211,10 @@ export async function releaseLock(lock: LockHandle): Promise<void> {
   }
   if (!lock.lockDir || !lock.acquired) return;
 
-  // #2058 (codex): only remove the lock if it is STILL ours. If we were reaped
-  // past the grace and another process re-acquired, removing its live lock
-  // would let a third process in alongside it — the corruption this fix exists
-  // to prevent. Unreadable/absent lock falls through to a best-effort remove.
+  // Only remove the lock if it is positively confirmed to still be ours.
   if (lock.ownerToken) {
-    try {
-      const raw = JSON.parse(readFileSync(join(lock.lockDir, LOCK_FILE), 'utf-8'));
-      if (tokenOf(raw) !== lock.ownerToken) return; // someone else owns it now
-    } catch { /* unreadable/gone — fall through to best-effort cleanup */ }
+    const raw = readLockRecord(join(lock.lockDir, LOCK_FILE));
+    if (!raw || tokenOf(raw) !== lock.ownerToken) return;
   }
 
   try {
