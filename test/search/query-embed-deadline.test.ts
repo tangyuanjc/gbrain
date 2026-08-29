@@ -34,6 +34,14 @@ describe('embedQueryBounded — query-embed deadline', () => {
     resetGateway();
   });
 
+  test('defaults to a 30s budget so the local bge-m3 shim can complete under load', () => {
+    const startedAt = Date.now();
+    const dl = makeQueryEmbedDeadline();
+
+    expect(dl.deadlineAt - startedAt).toBeGreaterThanOrEqual(29_900);
+    expect(dl.deadlineAt - startedAt).toBeLessThanOrEqual(30_100);
+  });
+
   test('rejects within the budget when the transport hangs (ignores abort)', async () => {
     // Transport never resolves AND ignores the abort signal — only the
     // Promise.race deadline can save us.
