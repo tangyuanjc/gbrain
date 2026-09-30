@@ -23,7 +23,7 @@ import { runMigrations } from './migrate.ts';
 import { PGLITE_SCHEMA_SQL, getPGLiteSchema } from './pglite-schema.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
-import { acquireLock, releaseLock, type LockHandle } from './pglite-lock.ts';
+import { acquireLock, releaseLock, appendLockEvent, type LockHandle } from './pglite-lock.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
   Chunk, ChunkInput, StaleChunkRow, StalePageRow,
@@ -225,6 +225,9 @@ export class PGLiteEngine implements BrainEngine {
   readonly kind = 'pglite' as const;
   private _db: PGLiteDB | null = null;
   private _lock: LockHandle | null = null;
+  private _closeFailed = false;
+  private _connectPromise: Promise<void> | null = null;
+  private _disconnectPromise: Promise<void> | null = null;
   // #2034: captured at connect() so reconnect() can restore the same data dir
   // after a drop, matching PostgresEngine's _savedConfig contract.
   private _savedConfig: EngineConfig | null = null;
@@ -240,6 +243,20 @@ export class PGLiteEngine implements BrainEngine {
 
   // Lifecycle
   async connect(config: EngineConfig): Promise<void> {
+    if (this._disconnectPromise) {
+      await this._disconnectPromise;
+      return this.connect(config);
+    }
+    if (this._connectPromise) return this._connectPromise;
+    if (this._db) return;
+    const pending = this.connectInternal(config);
+    this._connectPromise = pending;
+    try { await pending; }
+    finally { if (this._connectPromise === pending) this._connectPromise = null; }
+  }
+
+  private async connectInternal(config: EngineConfig): Promise<void> {
+    if (this._closeFailed) throw new Error('PGLite close failed; restart this process before reconnecting.');
     this._savedConfig = config; // #2034: remember for reconnect()
     const dataDir = config.database_path || undefined; // undefined = in-memory
 
@@ -267,7 +284,7 @@ export class PGLiteEngine implements BrainEngine {
     try {
       this._db = await preservingProcessExitCode(() =>
         PGlite.create({
-          dataDir,
+          dataDir: this._lock?.dataDir ?? dataDir,
           loadDataDir,
           extensions: { vector, pg_trgm },
         }),
@@ -285,7 +302,7 @@ export class PGLiteEngine implements BrainEngine {
       // Release the lock so a fresh process can try again; leaking the lock
       // here turns a recoverable init error into a stuck-brain state.
       if (this._lock?.acquired) {
-        try { await releaseLock(this._lock); } catch { /* ignore cleanup error */ }
+        try { await releaseLock(this._lock, 'open_failed'); } catch { /* ignore cleanup error */ }
         this._lock = null;
       }
       throw wrapped;
@@ -293,22 +310,32 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async disconnect(): Promise<void> {
+    if (this._disconnectPromise) return this._disconnectPromise;
+    const connecting = this._connectPromise;
+    const pending = (async () => {
+      // PGlite.create may still be opening the datastore while _db is null.
+      // Wait before deciding there is no database to close.
+      await connecting?.catch(() => {});
+      await this.disconnectInternal();
+    })();
+    this._disconnectPromise = pending;
+    try { await pending; }
+    finally { if (this._disconnectPromise === pending) this._disconnectPromise = null; }
+  }
+
+  private async disconnectInternal(): Promise<void> {
     // v0.41.8.0: snapshot + early-null up front so a concurrent
     // `connect()` cannot observe `_db` pointing at a handle that's
     // mid-close (partial-state race). Closes the bug class PR #1337
     // originally surfaced.
     //
-    // try/finally guarantees the file lock releases even if
-    // `db.close()` throws. Pre-fix, a close-throw would leak the
-    // lock and the next gbrain invocation would wedge waiting for it.
-    // The pre-fix code happened to work because the close branch
-    // ran first and the lock branch ran second only when close
-    // didn't throw — moving to the snapshot pattern made the
-    // try/finally explicitly necessary.
+    // A failed close can leave a live WASM database. Keep native ownership
+    // until process exit; another writer must never enter uncertain state.
     const db = this._db;
     this._db = null;
     const lock = this._lock;
     this._lock = null;
+    let closeStatus: 'closed' | 'close_failed' | 'not_opened' = db ? 'close_failed' : 'not_opened';
     try {
       if (db) {
         // Deliberately NOT wrapped in preservingProcessExitCode: close's
@@ -318,12 +345,16 @@ export class PGLiteEngine implements BrainEngine {
         // process.exitCode at all — it lives in the gbrain-owned channel
         // (setCliExitVerdict/currentExitCode in cli-force-exit.ts).
         await db.close();
+        closeStatus = 'closed';
       }
-    } finally {
-      if (lock?.acquired) {
-        await releaseLock(lock);
-      }
+    } catch (error) {
+      this._closeFailed = true;
+      if (lock?.acquired) appendLockEvent(lock, 'close_failed', 'close_failed');
+      // retainedOwners in pglite-lock keeps the native handle alive even if
+      // this engine is garbage-collected. The kernel releases it on exit.
+      throw error;
     }
+    if (lock?.acquired) await releaseLock(lock, closeStatus);
   }
 
   /**

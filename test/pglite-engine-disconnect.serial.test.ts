@@ -15,10 +15,8 @@
  *      partial mid-close state. PR #1337's load-bearing contribution
  *      that we DID take.
  *
- *   3. LOCK LEAK GUARD: if `db.close()` throws, the file lock STILL
- *      releases. Codex outside-voice finding #7 in the eng review:
- *      without try/finally, a close-throw would wedge every next
- *      gbrain invocation on the stale lock.
+ *   3. FAIL CLOSED: if db.close() throws, ownership remains held until
+ *      process exit. An uncertain live DB must never admit a second writer.
  *
  *   4. IDEMPOTENCY: calling disconnect() twice is a clean no-op on
  *      the second call (no throw, no double-close attempt).
@@ -32,9 +30,10 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync, mkdirSync, symlinkSync, unlinkSync, realpathSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { acquireLock, releaseLock, type LockHandle } from '../src/core/pglite-lock.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 
 function newTempDataDir(): string {
@@ -100,6 +99,9 @@ describe('PGLiteEngine.disconnect() — v0.41.8.0 lifecycle invariants', () => {
       expect(calls).toContain('db.close');
       expect(lockStillPresentAtCloseFinish).toBe(true);
       expect(existsSync(lockDir)).toBe(false);
+      const audit = readFileSync(join(dataDir, '.gbrain-lock-events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(audit.at(-1).close_ok).toBe(true);
+      expect(audit.at(-1).close_status).toBe('closed');
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -133,40 +135,26 @@ describe('PGLiteEngine.disconnect() — v0.41.8.0 lifecycle invariants', () => {
     }
   });
 
-  test('LOCK LEAK GUARD: if db.close() throws, lock still releases', async () => {
+  test('failed close retains ownership and refuses reconnect', async () => {
     const dataDir = newTempDataDir();
+    const engine = new PGLiteEngine();
+    await engine.connect({ database_path: dataDir });
+    const eng = engine as unknown as { _db: { close: () => Promise<void> }; _lock: LockHandle };
+    const db = eng._db, lock = eng._lock, realClose = db.close.bind(db);
     try {
-      const engine = new PGLiteEngine();
-      await engine.connect({ database_path: dataDir });
-      await engine.initSchema();
-
-      const eng = engine as unknown as {
-        _db: { close: () => Promise<void> } | null;
-        _lock: { lockDir: string; acquired: boolean } | null;
-      };
-
-      const { existsSync } = await import('fs');
-      const lockDir = eng._lock!.lockDir;
-      expect(existsSync(lockDir)).toBe(true);
-
-      // Force close to throw. The lock MUST still release.
-      eng._db!.close = async () => {
-        throw new Error('synthetic close failure');
-      };
-
-      // The throw will propagate out of disconnect — that's fine.
-      // The contract is "lock releases regardless."
-      let threw = false;
-      try {
-        await engine.disconnect();
-      } catch (e) {
-        threw = true;
-        expect(e instanceof Error && e.message).toContain('synthetic close failure');
-      }
-      expect(threw).toBe(true);
-      // CRITICAL: lock must be gone even though close threw.
-      expect(existsSync(lockDir)).toBe(false);
+      db.close = async () => { throw new Error('synthetic close failure'); };
+      await expect(engine.disconnect()).rejects.toThrow('synthetic close failure');
+      await expect(acquireLock(dataDir, { timeoutMs: 100 })).rejects.toThrow(/Timed out/);
+      await engine.disconnect(); // Repeated cleanup must not release uncertain ownership.
+      await expect(acquireLock(dataDir, { timeoutMs: 100 })).rejects.toThrow(/Timed out/);
+      await expect(engine.connect({ database_path: dataDir })).rejects.toThrow(/restart this process/);
+      const audit = readFileSync(join(dataDir, '.gbrain-lock-events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(audit.at(-1).event).toBe('close_failed');
+      expect(audit.at(-1).close_ok).toBe(false);
+      expect(audit.some(event => event.event === 'released')).toBe(false);
     } finally {
+      await realClose();
+      await releaseLock(lock, 'closed');
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
@@ -254,3 +242,59 @@ describe('PGLiteEngine: Emscripten process.exitCode containment (#2084)', () => 
     }
   }, 60_000);
 });
+
+test('connect opens the canonical datastore whose lock it acquired', async () => {
+  const root = newTempDataDir();
+  const a = join(root, 'a'), b = join(root, 'b'), alias = join(root, 'alias');
+  mkdirSync(a); mkdirSync(b); symlinkSync(a, alias);
+  const holder = await acquireLock(a);
+  const engine = new PGLiteEngine();
+  const connecting = engine.connect({ database_path: alias });
+  try {
+    // connect has resolved alias to a and is waiting for its native lock.
+    await Bun.sleep(50);
+    unlinkSync(alias); symlinkSync(b, alias);
+    await releaseLock(holder);
+    await connecting;
+    const db = engine.db as unknown as { dataDir: string };
+    expect(db.dataDir).toBe(realpathSync(a));
+    expect((await engine.executeRaw<{ ok: number }>('SELECT 1 AS ok'))[0].ok).toBe(1);
+  } finally {
+    await releaseLock(holder);
+    await connecting.catch(() => {});
+    await engine.disconnect();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 15000);
+
+test('disconnect during initialization keeps ownership until create and close settle', async () => {
+  const { PGlite } = await import('@electric-sql/pglite');
+  const realCreate = PGlite.create;
+  const root = newTempDataDir(), dir = join(root, 'db');
+  const engine = new PGLiteEngine();
+  let resume!: () => void, entered!: () => void;
+  const barrier = new Promise<void>(resolve => { resume = resolve; });
+  const creating = new Promise<void>(resolve => { entered = resolve; });
+  PGlite.create = (async (...args: any[]) => {
+    entered(); await barrier;
+    return (realCreate as any).apply(PGlite, args);
+  }) as typeof PGlite.create;
+  const connecting = engine.connect({ database_path: dir });
+  try {
+    await creating;
+    let disconnected = false;
+    const disconnecting = engine.disconnect().then(() => { disconnected = true; });
+    await expect(acquireLock(dir, { timeoutMs: 50 })).rejects.toThrow(/Timed out/);
+    expect(disconnected).toBe(false);
+    resume();
+    await Promise.all([connecting, disconnecting]);
+    expect(disconnected).toBe(true);
+    const next = await acquireLock(dir, { timeoutMs: 100 });
+    await releaseLock(next);
+  } finally {
+    resume(); PGlite.create = realCreate;
+    await connecting.catch(() => {});
+    await engine.disconnect();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 15000);

@@ -1,225 +1,214 @@
-/**
- * PGLite File Lock — prevents concurrent process access to the same data directory.
- *
- * PGLite uses embedded Postgres (WASM) which only supports one connection at a time.
- * When `gbrain embed` (which can take minutes) is running and another process tries
- * to connect, PGLite throws `Aborted()` because it can't handle concurrent access.
- *
- * This module implements a simple advisory lock using a lock file next to the data
- * directory. It uses atomic `mkdir` (which is POSIX-atomic) combined with PID tracking
- * for stale lock detection.
- *
- * Usage:
- *   const lock = await acquireLock(dataDir);
- *   try { ... } finally { await releaseLock(lock); }
+/** Kernel ownership for a persistent PGLite datastore; metadata is diagnostic.
+ * Backported from garrytan/gbrain v0.59.20.0 (introduced in d13aa742).
+ * Stop all older GBrain processes before migrating. Never unlink the stable
+ * sibling .gbrain-owner.lock file, including during datastore maintenance.
  */
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, rmSync, renameSync, realpathSync, readlinkSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
+import { tryAcquireNativeLock, type NativeLockHandle } from './persistence/native-lock.ts';
 
-import { mkdirSync, existsSync, readFileSync, writeFileSync, rmSync, statSync } from 'fs';
-import { join } from 'path';
-
-const LOCK_DIR_NAME = '.gbrain-lock';
-const LOCK_FILE = 'lock';
-
-// Refresh the lock's `refreshed_at` while held for operator observability.
-// Acquisition never uses heartbeat age to decide whether a holder is dead.
 const HEARTBEAT_INTERVAL_MS = 30_000;
+const LOCK_FILE = 'lock';
+// A dropped engine reference must never let GC release a still-open datastore.
+const retainedOwners = new Set<LockHandle>();
 
+export class PgliteBusyError extends Error {
+  readonly code = 'pglite_busy';
+  readonly retryable = true;
+  constructor(message: string) {
+    super(message); this.name = 'PgliteBusyError';
+  }
+}
 export interface LockHandle {
+  /** Legacy metadata directory. It is never the ownership authority. */
   lockDir: string;
   acquired: boolean;
-  /**
-   * #2058: heartbeat timer + lock-file path, set when a real (on-disk) lock is
-   * held so `releaseLock` can stop refreshing. Absent for the in-memory engine
-   * (no lock file, no concurrent access possible).
-   */
   heartbeat?: ReturnType<typeof setInterval>;
   lockPath?: string;
-  /**
-   * Our ownership token (`<pid>:<acquired_at>`). Heartbeat and release verify
-   * the on-disk lock is still ours before touching it so a stale handle cannot
-   * refresh or delete a replacement owner's lock.
-   */
   ownerToken?: string;
+  /** A dead legacy holder was encountered during protocol migration. */
+  reaped?: boolean;
+  nativeLock?: NativeLockHandle;
+  /** Canonical datastore path protected by nativeLock. */
+  dataDir?: string;
 }
 
-interface LockRecord {
-  pid: number;
-  acquired_at: number;
-  refreshed_at?: number;
-  command?: unknown;
-}
+export type LockCloseStatus = 'closed' | 'close_failed' | 'open_failed' | 'not_opened' | 'unknown';
 
-/** The on-disk lock identity, used to detect "we were reaped and replaced". */
-function tokenOf(lockData: Pick<LockRecord, 'pid' | 'acquired_at'>): string {
-  return `${lockData.pid}:${lockData.acquired_at}`;
-}
-
-function readLockRecord(lockPath: string): LockRecord | undefined {
+// A local append-only incident trail. Logging must never change lock semantics.
+// An unmatched acquisition is evidence of missing orderly release, not by itself
+// proof of SIGKILL (disk-full/log-write errors and host failure are also possible).
+export function appendLockEvent(lock: LockHandle, event: 'acquired' | 'released' | 'close_failed', closeStatus: LockCloseStatus = 'unknown', releaseStartedAt?: string): void {
+  if (!lock.lockDir) return;
   try {
-    const parsed: unknown = JSON.parse(readFileSync(lockPath, 'utf-8'));
-    if (typeof parsed !== 'object' || parsed === null) return undefined;
-    const record = parsed as Record<string, unknown>;
-    if (!Number.isSafeInteger(record.pid) || (record.pid as number) <= 0) return undefined;
-    if (!Number.isSafeInteger(record.acquired_at) || (record.acquired_at as number) <= 0) return undefined;
-    return record as unknown as LockRecord;
+    appendFileSync(join(dirname(lock.lockDir), '.gbrain-lock-events.jsonl'), JSON.stringify({
+      at: new Date().toISOString(), event, pid: process.pid,
+      command: process.argv.slice(1).join(' '), owner_token: lock.ownerToken,
+      data_dir: dirname(lock.lockDir), close_status: closeStatus,
+      release_started_at: releaseStartedAt,
+      close_ok: closeStatus === 'closed' ? true : closeStatus === 'close_failed' ? false : null,
+    }) + '\n', { mode: 0o600 });
   } catch {
-    return undefined;
+    console.warn('[gbrain] could not append PGLite lock audit event');
   }
 }
 
-/**
- * Keep the held lock's `refreshed_at` current for observability. Acquisition
- * never uses heartbeat age to reap a live PID. Best-effort: if the record is
- * unreadable or no longer ours, stop instead of clobbering another owner.
- * `.unref()` ensures the timer never keeps the process alive on its own.
- */
-function startHeartbeat(lockPath: string, ownerToken: string): ReturnType<typeof setInterval> {
+interface LockMetadata {
+  pid?: number;
+  acquired_at?: number;
+  refreshed_at?: number;
+  command?: string;
+  argv?: string[];
+  owner_token?: string;
+  protocol?: string;
+  pid_ns?: string | null;
+  boot_id?: string | null;
+}
+const protocol = 'kernel-v1';
+function tokenOf(metadata: LockMetadata): string {
+  return metadata.owner_token ?? `${metadata.pid}:${metadata.acquired_at}`;
+}
+function readMetadata(lockDir: string): LockMetadata | null {
+  try {
+    const raw: unknown = JSON.parse(readFileSync(join(lockDir, LOCK_FILE), 'utf8'));
+    if (!raw || typeof raw !== 'object') return null;
+    const metadata = raw as LockMetadata;
+    if (!Number.isSafeInteger(metadata.pid) || metadata.pid! <= 0
+      || !Number.isSafeInteger(metadata.acquired_at) || metadata.acquired_at! <= 0) return null;
+    return metadata;
+  } catch { return null; }
+}
+function readPidNs(): string | null {
+  try { return readlinkSync('/proc/self/ns/pid'); } catch { return null; }
+}
+function readBootId(): string | null {
+  try { return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null; } catch { return null; }
+}
+
+/** Resolve existing ancestors without creating the datastore during inspection. */
+function canonicalPath(path: string): string {
+  const absolute = resolve(path);
+  try { return realpathSync(absolute); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    const parent = dirname(absolute);
+    if (parent === absolute) throw error;
+    return join(canonicalPath(parent), basename(absolute));
+  }
+}
+/** Stable sibling survives datastore replacement. Never unlink this file. */
+export function getPgliteKernelLockPath(dataDir: string | undefined): string | undefined {
+  return dataDir ? `${canonicalPath(dataDir)}.gbrain-owner.lock` : undefined;
+}
+function getLockDir(dataDir: string | undefined): string {
+  return dataDir ? join(dataDir, '.gbrain-lock') : '';
+}
+
+/** PID is used for diagnostics and legacy migration, never kernel takeover. */
+export function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+}
+
+function writeMetadata(path: string, metadata: LockMetadata): void {
+  const temporary = `${path}.tmp-${metadata.owner_token}`;
+  try {
+    writeFileSync(temporary, JSON.stringify(metadata), { mode: 0o600 });
+    renameSync(temporary, path);
+  } finally { rmSync(temporary, { force: true }); }
+}
+function startHeartbeat(path: string, ownerToken: string): ReturnType<typeof setInterval> {
   const timer = setInterval(() => {
     try {
-      const raw = readLockRecord(lockPath);
-      if (!raw || tokenOf(raw) !== ownerToken) {
-        // Ownership is no longer certain — do not refresh this lock.
-        clearInterval(timer);
-        return;
-      }
-      raw.refreshed_at = Date.now();
-      writeFileSync(lockPath, JSON.stringify(raw), { mode: 0o644 });
-    } catch { /* best-effort — file removed or transient FS error */ }
+      const metadata = JSON.parse(readFileSync(path, 'utf8')) as LockMetadata;
+      if (tokenOf(metadata) !== ownerToken) { clearInterval(timer); return; }
+      metadata.refreshed_at = Date.now();
+      writeMetadata(path, metadata);
+    } catch { /* Metadata failure cannot change kernel ownership. */ }
   }, HEARTBEAT_INTERVAL_MS);
-  (timer as { unref?: () => void }).unref?.();
+  timer.unref?.();
   return timer;
 }
-
-function getLockDir(dataDir: string | undefined): string {
-  // Use the parent of the data dir for the lock, or a temp location for in-memory
-  if (!dataDir) {
-    // In-memory PGLite — no concurrent access possible since it's process-scoped
-    // Return a sentinel that we skip
-    return '';
-  }
-  return join(dataDir, LOCK_DIR_NAME);
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    // Sending signal 0 checks existence without actually sending a signal
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // ESRCH confirms the PID is gone. EPERM and unknown probe failures do not
-    // prove death, so keep the lock and fail closed.
-    return (error as NodeJS.ErrnoException)?.code !== 'ESRCH';
-  }
+function busy(lockDir: string): PgliteBusyError {
+  return new PgliteBusyError(`GBrain: Timed out waiting for PGLite lock at ${lockDir}. Retry after the holder finishes. Stop all older GBrain processes before upgrading this datastore's lock protocol; unreadable legacy ownership is never stolen. Never remove a live holder's lock. This lock is separate from \`gbrain sync --break-lock\`.`);
 }
 
 /**
- * Attempt to acquire an exclusive lock on the PGLite data directory.
- * Returns { acquired: true } if the lock was obtained, { acquired: false } otherwise.
- * Stale locks (from dead processes) are automatically cleaned up.
+ * First kernel acquisition also claims the legacy mkdir lock. A live or
+ * unreadable legacy holder blocks migration. After migration, pid/mtime/
+ * metadata corruption cannot authorize or prevent native ownership.
+ * All older GBrain processes must be stopped before the protocol upgrade.
  */
-export async function acquireLock(dataDir: string | undefined, opts?: { timeoutMs?: number }): Promise<LockHandle> {
-  const lockDir = getLockDir(dataDir);
-
-  // In-memory PGLite — no lock needed (process-scoped, can't be shared)
-  if (!lockDir) {
-    return { lockDir: '', acquired: true };
-  }
-
-  // `lockDir` being set implies `dataDir` is set (see getLockDir), but TS
-  // can't derive that across helper boundaries.
-  mkdirSync(dataDir as string, { recursive: true });
-
-  const timeoutMs = opts?.timeoutMs ?? 30_000; // 30 second default timeout
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < timeoutMs) {
-    // Check for stale lock first
-    if (existsSync(lockDir)) {
-      const lockPath = join(lockDir, LOCK_FILE);
-      const lockData = readLockRecord(lockPath);
-      if (!lockData) {
-        // Missing, partially written, or malformed ownership is not evidence
-        // that no writer exists. Preserve the directory and fail closed.
-        await new Promise(r => setTimeout(r, 1000));
-        continue;
-      }
-
-      if (!isProcessAlive(lockData.pid)) {
-        // A valid record whose holder process is gone is safe to reap.
-        try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* race condition, try again */ }
-      } else {
-        // Heartbeats run on the JS event loop and can stop during synchronous
-        // PGLite/WASM work. A live PID is therefore never stolen automatically.
-        await new Promise(r => setTimeout(r, 1000));
-        continue;
-      }
-    }
-
-    // Try to acquire lock (atomic mkdir)
-    try {
-      mkdirSync(lockDir, { recursive: false });
-      // We got the lock — write our PID. #2058: seed `refreshed_at` and start
-      // the heartbeat so this holder reads as alive-and-working to others.
-      const lockPath = join(lockDir, LOCK_FILE);
-      const now = Date.now();
-      writeFileSync(lockPath, JSON.stringify({
-        pid: process.pid,
-        acquired_at: now,
-        refreshed_at: now,
-        command: process.argv.slice(1).join(' '),
-      }), { mode: 0o644 });
-
-      const ownerToken = tokenOf({ pid: process.pid, acquired_at: now });
-      return { lockDir, acquired: true, lockPath, ownerToken, heartbeat: startHeartbeat(lockPath, ownerToken) };
-    } catch (e: unknown) {
-      // mkdir failed — someone else grabbed it between our check and mkdir
-      // This is fine, we'll retry
-      if (Date.now() - startTime >= timeoutMs) {
-        // Timeout — report which process holds the lock
-        const lockPath = join(lockDir, LOCK_FILE);
-        try {
-          const lockData = JSON.parse(readFileSync(lockPath, 'utf-8'));
-          throw new Error(
-            `GBrain: Timed out waiting for PGLite lock. Process ${lockData.pid} has held it since ${new Date(lockData.acquired_at).toISOString()} (command: ${lockData.command}). ` +
-            `If that process is dead, remove ${lockDir} and try again.`
-          );
-        } catch (readErr) {
-          if (readErr instanceof Error && readErr.message.startsWith('GBrain')) throw readErr;
-          throw new Error(
-            `GBrain: Timed out waiting for PGLite lock. Remove ${lockDir} and try again.`
-          );
+export async function acquireLock(dataDir: string | undefined, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<LockHandle> {
+  if (!dataDir) return { lockDir: '', acquired: true };
+  const timeoutMs = opts.timeoutMs ?? 30_000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 2 ** 31 - 1) throw new RangeError('Invalid PGLite lock timeout');
+  const canonical = canonicalPath(dataDir);
+  const kernelPath = getPgliteKernelLockPath(canonical)!;
+  const markerPath = `${canonical}.gbrain-owner.json`;
+  const lockDir = getLockDir(canonical);
+  const deadline = performance.now() + timeoutMs;
+  for (;;) {
+    opts.signal?.throwIfAborted();
+    const nativeLock = await tryAcquireNativeLock(kernelPath);
+    if (nativeLock) {
+      let accepted = false;
+      try {
+        let migrated = false;
+        try { migrated = JSON.parse(readFileSync(markerPath, 'utf8')).protocol === protocol; } catch { /* first upgrade */ }
+        mkdirSync(canonical, { recursive: true });
+        let reaped = false;
+        try { mkdirSync(lockDir); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+          const metadata = readMetadata(lockDir);
+          if (!migrated || (metadata && metadata.protocol !== protocol)) {
+            // Legacy death requires matching namespace evidence on Linux;
+            // ESRCH from another container's PID namespace proves nothing.
+            const comparable = process.platform !== 'linux' || (metadata?.pid_ns === readPidNs()
+              && metadata?.boot_id === readBootId() && metadata?.pid_ns != null && metadata?.boot_id != null);
+            if (!metadata || !comparable || isProcessAlive(metadata.pid!)) throw busy(lockDir);
+            reaped = true;
+          }
         }
-      }
-      // Brief wait before retry
-      await new Promise(r => setTimeout(r, 500));
+        opts.signal?.throwIfAborted();
+        writeFileSync(markerPath, JSON.stringify({ protocol }), { mode: 0o600 });
+        const now = Date.now(), ownerToken = randomUUID(), lockPath = join(lockDir, LOCK_FILE);
+        writeMetadata(lockPath, { pid: process.pid, acquired_at: now, refreshed_at: now,
+          command: process.argv.slice(1).join(' '), argv: process.argv.slice(1),
+          owner_token: ownerToken, protocol, pid_ns: readPidNs(), boot_id: readBootId() });
+        const result = { lockDir, acquired: true, lockPath, ownerToken, reaped, nativeLock, dataDir: canonical,
+          heartbeat: startHeartbeat(lockPath, ownerToken) };
+        retainedOwners.add(result);
+        accepted = true;
+        appendLockEvent(result, 'acquired');
+        return result;
+      } catch (error) {
+        if (!(error instanceof PgliteBusyError) || performance.now() >= deadline) throw error;
+      } finally { if (!accepted) await nativeLock.release(); }
     }
+    if (performance.now() >= deadline) throw busy(lockDir);
+    await delay(Math.min(25, deadline - performance.now()), undefined, { signal: opts.signal });
   }
-
-  // Should not reach here, but just in case
-  throw new Error(`GBrain: Timed out waiting for PGLite lock.`);
 }
 
-/**
- * Release a previously acquired lock.
- */
-export async function releaseLock(lock: LockHandle): Promise<void> {
-  // #2058: stop the heartbeat first so it can't recreate/rewrite the lock file
-  // after we remove it.
-  if (lock.heartbeat) {
-    clearInterval(lock.heartbeat);
-    lock.heartbeat = undefined;
+/** Metadata removal is optional; kernel release is mandatory and never unlinks. */
+export async function releaseLock(lock: LockHandle, closeStatus: LockCloseStatus = 'unknown'): Promise<void> {
+  if (!lock.acquired) return;
+  if (lock.heartbeat) { clearInterval(lock.heartbeat); lock.heartbeat = undefined; }
+  if (lock.lockDir && lock.ownerToken) {
+    const metadata = readMetadata(lock.lockDir);
+    if (metadata && tokenOf(metadata) === lock.ownerToken) {
+      try { rmSync(lock.lockDir, { recursive: true, force: true }); } catch { /* diagnostic only */ }
+    }
   }
-  if (!lock.lockDir || !lock.acquired) return;
-
-  // Only remove the lock if it is positively confirmed to still be ours.
-  if (lock.ownerToken) {
-    const raw = readLockRecord(join(lock.lockDir, LOCK_FILE));
-    if (!raw || tokenOf(raw) !== lock.ownerToken) return;
-  }
-
-  try {
-    rmSync(lock.lockDir, { recursive: true, force: true });
-  } catch {
-    // Lock file already removed (e.g., by stale cleanup) — that's fine
-  }
+  // Success is logged only after the OS handle closes. A successor can log
+  // first, so audit consumers use this handoff start only for confirmed releases.
+  const releaseStartedAt = new Date().toISOString();
+  await lock.nativeLock?.release();
+  appendLockEvent(lock, 'released', closeStatus, releaseStartedAt);
+  lock.acquired = false;
+  retainedOwners.delete(lock);
 }

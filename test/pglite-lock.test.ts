@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'fs';
+import { mkdirSync, rmSync, existsSync, readFileSync, readlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { acquireLock, releaseLock, type LockHandle } from '../src/core/pglite-lock';
@@ -10,11 +10,15 @@ describe('pglite-lock', () => {
   beforeEach(() => {
     // Clean up test directory
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true, force: true });
+    rmSync(`${TEST_DIR}.gbrain-owner.lock`, { force: true });
+    rmSync(`${TEST_DIR}.gbrain-owner.json`, { force: true });
     mkdirSync(TEST_DIR, { recursive: true });
   });
 
   afterEach(() => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true, force: true });
+    rmSync(`${TEST_DIR}.gbrain-owner.lock`, { force: true });
+    rmSync(`${TEST_DIR}.gbrain-owner.json`, { force: true });
   });
 
   test('acquires and releases lock', async () => {
@@ -53,6 +57,7 @@ describe('pglite-lock', () => {
     const lockDir = join(TEST_DIR, '.gbrain-lock');
     mkdirSync(lockDir);
     writeFileSync(join(lockDir, 'lock'), JSON.stringify({
+      ...(process.platform === 'linux' ? { pid_ns: readlinkSync('/proc/self/ns/pid'), boot_id: readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() } : {}),
       pid: 999999999, // Non-existent PID
       acquired_at: Date.now(),
       command: 'test',
@@ -85,6 +90,27 @@ describe('pglite-lock', () => {
     await releaseLock(lock);
   });
 
+  test('audit pairs ownership and close result without duplicate releases', async () => {
+    const lock = await acquireLock(TEST_DIR);
+    await releaseLock(lock, 'closed');
+    await releaseLock(lock, 'closed');
+    const lines = readFileSync(join(TEST_DIR, '.gbrain-lock-events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(lines.map(line => line.event)).toEqual(['acquired', 'released']);
+    expect(lines[0].owner_token).toBe(lines[1].owner_token);
+    expect(lines[0].pid).toBe(process.pid);
+    expect(lines[0].close_ok).toBeNull();
+    expect(lines[1].close_ok).toBe(true);
+    expect(lines[1].close_status).toBe('closed');
+  });
+
+  test('audit failure cannot strand a lock', async () => {
+    mkdirSync(join(TEST_DIR, '.gbrain-lock-events.jsonl'));
+    const lock = await acquireLock(TEST_DIR);
+    expect(lock.acquired).toBe(true);
+    await releaseLock(lock, 'close_failed');
+    expect(existsSync(join(TEST_DIR, '.gbrain-lock'))).toBe(false);
+  });
+
   test('releases lock on disconnect even if DB close fails', async () => {
     const lock = await acquireLock(TEST_DIR);
     expect(lock.acquired).toBe(true);
@@ -103,10 +129,14 @@ describe('pglite-lock', () => {
 describe('pglite-lock heartbeat + ownership', () => {
   beforeEach(() => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true, force: true });
+    rmSync(`${TEST_DIR}.gbrain-owner.lock`, { force: true });
+    rmSync(`${TEST_DIR}.gbrain-owner.json`, { force: true });
     mkdirSync(TEST_DIR, { recursive: true });
   });
   afterEach(() => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true, force: true });
+    rmSync(`${TEST_DIR}.gbrain-owner.lock`, { force: true });
+    rmSync(`${TEST_DIR}.gbrain-owner.json`, { force: true });
   });
 
   function writeHolder(fields: { pid: number; acquiredAgoMs: number; refreshedAgoMs: number }) {
