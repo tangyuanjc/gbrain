@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { withEnv } from '../helpers/with-env.ts';
 import { getRecipe } from '../../src/core/ai/recipes/index.ts';
 import { buildGatewayConfig } from '../../src/core/ai/build-gateway-config.ts';
 
@@ -15,19 +16,14 @@ describe('recipe: local-sentence-transformers', () => {
     expect(r!.auth_env!.required).toEqual([]);
   });
 
-  test('threads LOCAL_SENTENCE_TRANSFORMERS_BASE_URL into gateway base URLs', () => {
-    const prev = process.env.LOCAL_SENTENCE_TRANSFORMERS_BASE_URL;
-    process.env.LOCAL_SENTENCE_TRANSFORMERS_BASE_URL = 'http://127.0.0.1:8765/v1';
-    try {
+  test('threads LOCAL_SENTENCE_TRANSFORMERS_BASE_URL into gateway base URLs', async () => {
+    await withEnv({ LOCAL_SENTENCE_TRANSFORMERS_BASE_URL: 'http://127.0.0.1:8765/v1' }, () => {
       const cfg = buildGatewayConfig({
         engine: 'pglite',
         embedding_model: 'local-sentence-transformers:BAAI/bge-m3',
         embedding_dimensions: 1536,
       });
       expect(cfg.base_urls?.['local-sentence-transformers']).toBe('http://127.0.0.1:8765/v1');
-    } finally {
-      if (prev === undefined) delete process.env.LOCAL_SENTENCE_TRANSFORMERS_BASE_URL;
-      else process.env.LOCAL_SENTENCE_TRANSFORMERS_BASE_URL = prev;
-    }
+    });
   });
 });
