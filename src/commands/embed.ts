@@ -1,3 +1,5 @@
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
+import type { EmbedReceipts } from '../core/embed-detached.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { embedBatch, currentEmbeddingSignature } from '../core/embedding.ts';
 import type { ChunkInput } from '../core/types.ts';
@@ -71,6 +73,10 @@ export interface EmbedOpts {
    * with the internal wall-clock budget timer via `anySignal`.
    */
   signal?: AbortSignal;
+  /** CLI-only: caller owns a file-backed PGLite connection exclusively.
+   * Allows --stale to close it while waiting for the embedding service.
+   * Never enable for shared workers, sync, MCP, or an in-memory database. */
+  exclusivePglite?: boolean;
 }
 
 /**
@@ -211,6 +217,7 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
       batchSize: opts.batchSize,
       priority: opts.priority,
       catchUp: opts.catchUp,
+      exclusivePglite: opts.exclusivePglite,
     }, opts.signal);
     return result;
   }
@@ -221,7 +228,7 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
   throw new Error('No embed target specified. Pass { slug }, { slugs }, { all }, or { stale }.');
 }
 
-export async function runEmbed(engine: BrainEngine, args: string[]): Promise<EmbedResult | undefined> {
+export async function runEmbed(engine: BrainEngine, args: string[], exclusivePglite = false): Promise<EmbedResult | undefined> {
   // v0.36+ T7: --background submits via Minion queue, returns job_id to
   // stdout, exits. Same semantics in TTY and cron (D9).
   if (args.includes('--background')) {
@@ -282,6 +289,11 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
   // onProgress (see jobs.ts).
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
   let progressStarted = false;
+  opts.exclusivePglite = exclusivePglite;
+  const controller = new AbortController();
+  const abort = () => { controller.abort(); setCliExitVerdict(130); };
+  opts.signal = controller.signal;
+  process.on('SIGINT', abort);
   opts.onProgress = (done, total, _embedded) => {
     if (!progressStarted) {
       progress.start('embed.pages', total);
@@ -296,6 +308,8 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
     return result;
   } catch (e) {
     if (progressStarted) progress.finish();
+    // Preserve the signal exit verdict and let CLI teardown close the DB.
+    if (controller.signal.aborted) return undefined;
     // v0.41.6.0 D1: preflight throws EmbeddingCredentialError; surface the
     // paste-ready userMessage instead of the bare exception text.
     const { EmbeddingCredentialError } = await import('../core/embed-preflight.ts');
@@ -311,6 +325,8 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
       serr(e instanceof Error ? e.message : String(e));
     }
     process.exit(1);
+  } finally {
+    process.off('SIGINT', abort);
   }
 }
 
@@ -416,6 +432,7 @@ async function embedAll(
     batchSize?: number;
     priority?: 'recent';
     catchUp?: boolean;
+    exclusivePglite?: boolean;
   },
   signal?: AbortSignal,
 ) {
@@ -576,6 +593,7 @@ async function embedAllStale(
     batchSize?: number;
     priority?: 'recent';
     catchUp?: boolean;
+    exclusivePglite?: boolean;
   },
   signature?: string,
   externalSignal?: AbortSignal,
@@ -625,7 +643,8 @@ async function embedAllStale(
   // we page through 2000 rows at a time via keyset pagination on
   // (page_id, chunk_index). Each query finishes in <1s.
   // v0.41.18.0 (A13): --batch-size N CLI flag overrides hardcoded 2000 default.
-  const PAGE_SIZE = staleOpts?.batchSize ?? 2000;
+  const detached = engine.kind === 'pglite' && staleOpts?.exclusivePglite === true;
+  const PAGE_SIZE = Math.min(staleOpts?.batchSize ?? 2000, detached ? 64 : 10000);
   const CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
 
   // D3 + D3a + D8: wall-clock budget. 30 min default; env override.
@@ -669,6 +688,7 @@ async function embedAllStale(
   // with stale chunks still remaining (un-embeddable for a non-transient reason)
   // surfaces that loudly instead of looking like a clean run.
   let embedFailures = 0;
+  const receipts: EmbedReceipts = new Map();
 
   try {
     // eslint-disable-next-line no-constant-condition
@@ -721,6 +741,29 @@ async function embedAllStale(
 
       const keys = Array.from(byKey.keys());
       result.total_chunks += batch.length;
+
+      if (detached) {
+        const { embedDetachedBatch } = await import('../core/embed-detached.ts');
+        const { getEmbeddingModel } = await import('../core/ai/gateway.ts');
+        const outcome = await embedDetachedBatch(engine, batch, {
+          receipts, signature: signature!, model: getEmbeddingModel(), concurrency: CONCURRENCY,
+          signal: effectiveSignal,
+          embed: (texts, signal) => embedBatchWithBackoff(texts, { abortSignal: signal }),
+        });
+        // Keyset order keeps a page contiguous. Only the trailing page can
+        // continue into the next batch; discard receipts for incomplete pages
+        // left behind (e.g. concurrent edits) rather than retain corpus text.
+        for (const pageId of receipts.keys()) if (pageId !== last.page_id) receipts.delete(pageId);
+        result.embedded += outcome.embedded;
+        result.skipped += outcome.skipped;
+        embedFailures += outcome.failures.length;
+        for (const failure of outcome.failures) serr(`\n  Error embedding ${failure}`);
+        totalProcessedPages += keys.length;
+        result.pages_processed += keys.length;
+        onProgress?.(totalProcessedPages, Math.ceil(staleCount / PAGE_SIZE) * keys.length, result.embedded);
+        if (batch.length < PAGE_SIZE) break;
+        continue;
+      }
 
       async function embedOneKey(key: string) {
         const stale = byKey.get(key)!;

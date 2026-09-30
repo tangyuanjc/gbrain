@@ -1550,7 +1550,10 @@ async function handleCliOnly(command: string, args: string[]) {
       }
       case 'embed': {
         const { runEmbed } = await import('./commands/embed.ts');
-        await runEmbed(engine, args);
+        // This command owns the connection and has no DB-backed progress worker.
+        // Shared/library callers deliberately keep the default false.
+        const fileBacked = !!toEngineConfig(loadConfig()!).database_path;
+        await runEmbed(engine, args, engine.kind === 'pglite' && fileBacked);
         break;
       }
       case 'serve': {
