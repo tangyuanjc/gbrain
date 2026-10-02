@@ -3,7 +3,7 @@
  * Stop all older GBrain processes before migrating. Never unlink the stable
  * sibling .gbrain-owner.lock file, including during datastore maintenance.
  */
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, rmSync, renameSync, realpathSync, readlinkSync } from 'node:fs';
+import { appendFileSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeFileSync, rmSync, renameSync, realpathSync, readlinkSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -119,6 +119,35 @@ function writeMetadata(path: string, metadata: LockMetadata): void {
     renameSync(temporary, path);
   } finally { rmSync(temporary, { force: true }); }
 }
+function syncMarkerDirectory(path: string): void {
+  // POSIX requires directory fsync to persist rename. Node cannot open a
+  // directory for fsync on Windows; file fsync + atomic rename still apply.
+  if (process.platform !== 'win32') {
+    const parent = openSync(dirname(path), 'r');
+    try { fsyncSync(parent); } finally { closeSync(parent); }
+  }
+}
+/** Publish once, before writing diagnostic ownership. Never truncate the marker. */
+function writeMigrationMarker(path: string): void {
+  const temporary = `${path}.tmp-${randomUUID()}`;
+  try {
+    const fd = openSync(temporary, 'wx', 0o600);
+    try {
+      writeFileSync(fd, JSON.stringify({ protocol }));
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    renameSync(temporary, path);
+    syncMarkerDirectory(path);
+  } finally { rmSync(temporary, { force: true }); }
+}
+function syncMigrationMarker(path: string): void {
+  // A predecessor may have exited after rename but before directory fsync.
+  // Also make markers from the older truncate/write implementation durable.
+  // Sync without rewriting: inode, content and mtime remain unchanged.
+  const fd = openSync(path, process.platform === 'win32' ? 'r+' : 'r');
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+  syncMarkerDirectory(path);
+}
 function startHeartbeat(path: string, ownerToken: string): ReturnType<typeof setInterval> {
   const timer = setInterval(() => {
     try {
@@ -174,7 +203,8 @@ export async function acquireLock(dataDir: string | undefined, opts: { timeoutMs
           }
         }
         opts.signal?.throwIfAborted();
-        writeFileSync(markerPath, JSON.stringify({ protocol }), { mode: 0o600 });
+        if (!migrated) writeMigrationMarker(markerPath);
+        else syncMigrationMarker(markerPath);
         const now = Date.now(), ownerToken = randomUUID(), lockPath = join(lockDir, LOCK_FILE);
         writeMetadata(lockPath, { pid: process.pid, acquired_at: now, refreshed_at: now,
           command: process.argv.slice(1).join(' '), argv: process.argv.slice(1),

@@ -30,6 +30,17 @@ Linux also requires matching PID namespace and boot ID before interpreting a
 legacy PID as dead. Handle an uncertain legacy record only in a quiescent
 maintenance window. The migration marker does not make mixed versions safe.
 
+The migration marker is published only when missing/invalid, using a unique
+temporary file, file fsync, atomic rename and (on POSIX) parent-directory fsync.
+Later acquisitions never rewrite it; they sync the existing file and directory
+before writing diagnostic ownership, covering a predecessor that exited between
+rename and directory fsync. Publication/sync errors fail acquisition. Windows
+retains file fsync and atomic rename; directory durability is not verified there.
+An already damaged marker with an empty or live-PID record still fails closed:
+the mere existence of the native lock file does not prove prior migration.
+Likewise, interruption of the first-ever legacy mkdir claim before publication
+may leave an ambiguous empty legacy directory; it requires quiescent maintenance.
+
 A failed database close keeps ownership until process exit and refuses reconnect
 on that engine. Disconnect waits for pending initialization before closing and
 releasing. The database opens the same canonical path whose lock was acquired.

@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readlinkSync, existsSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readlinkSync, existsSync, rmSync, symlinkSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { acquireLock, releaseLock, getPgliteKernelLockPath } from '../src/core/pglite-lock.ts';
@@ -136,3 +136,138 @@ test('native close errors remain failures on repeated release without retrying c
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+const publicationFixture = join(import.meta.dir, 'fixtures/pglite-lock/marker-publication.ts');
+test('migration claims legacy directory, then syncs and atomically publishes marker before diagnostic ownership', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gbrain-kernel-test-'));
+  const dir = join(root, 'db');
+  const child = Bun.spawn([process.execPath, publicationFixture, dir, 'trace'], { stdout: 'pipe', stderr: 'inherit' });
+  try {
+    expect(await child.exited).toBe(0);
+    expect(JSON.parse(await new Response(child.stdout).text()).events).toEqual([
+      'lockdir-created', 'temp-written', 'file-synced', 'marker-renamed',
+      ...(process.platform === 'win32' ? [] : ['directory-synced']),
+      'metadata-renamed',
+    ]);
+  } finally { await child.exited; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('steady acquisitions leave the migration marker inode, content and mtime unchanged', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gbrain-kernel-test-'));
+  const dir = join(root, 'db');
+  try {
+    await releaseLock(await acquireLock(dir));
+    const marker = `${dir}.gbrain-owner.json`;
+    const before = statSync(marker);
+    const content = readFileSync(marker, 'utf8');
+    const child = Bun.spawn([process.execPath, publicationFixture, dir, 'steady'], { stdout: 'pipe', stderr: 'inherit' });
+    expect(await child.exited).toBe(0);
+    const events = JSON.parse(await new Response(child.stdout).text()).events;
+    expect(events.filter((event: string) => event.startsWith('marker') || event.startsWith('temp'))).toEqual([]);
+    expect(statSync(marker).ino).toBe(before.ino);
+    expect(statSync(marker).mtimeMs).toBe(before.mtimeMs);
+    expect(readFileSync(marker, 'utf8')).toBe(content);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+for (const phase of ['temp-written', 'file-synced', 'marker-renamed',
+  ...(process.platform === 'win32' ? [] : ['directory-synced']), 'metadata-renamed']) {
+  test(`dead-legacy migration SIGKILL after ${phase} leaves a recoverable state`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-kernel-test-'));
+    const dir = join(root, 'db');
+    stale(dir);
+    const child = Bun.spawn([process.execPath, publicationFixture, dir, phase], { stdout: 'ignore', stderr: 'inherit' });
+    try {
+      await wait(root, 'paused');
+      const marker = `${dir}.gbrain-owner.json`;
+      if (existsSync(marker)) expect(JSON.parse(readFileSync(marker, 'utf8')).protocol).toBe('kernel-v1');
+      child.kill('SIGKILL'); await child.exited;
+      const successor = await acquireLock(dir, { timeoutMs: 1000 });
+      await releaseLock(successor);
+    } finally {
+      if (child.exitCode === null) child.kill('SIGKILL');
+      await child.exited;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15000);
+}
+
+test('failed marker write leaves the validated legacy record intact and recoverable', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gbrain-kernel-test-'));
+  const dir = join(root, 'db');
+  stale(dir);
+  const legacy = readFileSync(join(dir, '.gbrain-lock', 'lock'), 'utf8');
+  const child = Bun.spawn([process.execPath, publicationFixture, dir, 'fail-temp-written'], { stdout: 'pipe', stderr: 'inherit' });
+  try {
+    expect(await child.exited).toBe(0);
+    expect(JSON.parse(await new Response(child.stdout).text()).failure).toContain('synthetic temp-written failure');
+    expect(readFileSync(join(dir, '.gbrain-lock', 'lock'), 'utf8')).toBe(legacy);
+    expect(existsSync(`${dir}.gbrain-owner.json`)).toBe(false);
+    await releaseLock(await acquireLock(dir, { timeoutMs: 1000 }));
+  } finally { await child.exited; rmSync(root, { recursive: true, force: true }); }
+});
+
+test.skipIf(process.platform === 'win32')('successor syncs a marker left by failed directory fsync before diagnostic ownership', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gbrain-kernel-test-'));
+  const dir = join(root, 'db');
+  stale(dir);
+  try {
+    const failed = Bun.spawn([process.execPath, publicationFixture, dir, 'fail-directory-sync'], { stdout: 'pipe', stderr: 'inherit' });
+    expect(await failed.exited).toBe(0);
+    expect(JSON.parse(await new Response(failed.stdout).text()).failure).toContain('synthetic directory fsync failure');
+    const before = statSync(`${dir}.gbrain-owner.json`);
+    const successor = Bun.spawn([process.execPath, publicationFixture, dir, 'trace'], { stdout: 'pipe', stderr: 'inherit' });
+    expect(await successor.exited).toBe(0);
+    expect(JSON.parse(await new Response(successor.stdout).text()).events).toEqual(['file-synced', 'directory-synced', 'metadata-renamed']);
+    expect(statSync(`${dir}.gbrain-owner.json`).ino).toBe(before.ino);
+    expect(statSync(`${dir}.gbrain-owner.json`).mtimeMs).toBe(before.mtimeMs);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+for (const phase of ['lockdir-created', 'metadata-renamed']) {
+  test(`migrated owner SIGKILL after ${phase} preserves the marker and recovers`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-kernel-test-'));
+    const dir = join(root, 'db');
+    await releaseLock(await acquireLock(dir));
+    const before = statSync(`${dir}.gbrain-owner.json`);
+    const child = Bun.spawn([process.execPath, publicationFixture, dir, phase], { stdout: 'ignore', stderr: 'inherit' });
+    try {
+      await wait(root, 'paused');
+      child.kill('SIGKILL'); await child.exited;
+      expect(JSON.parse(readFileSync(`${dir}.gbrain-owner.json`, 'utf8')).protocol).toBe('kernel-v1');
+      expect(statSync(`${dir}.gbrain-owner.json`).ino).toBe(before.ino);
+      expect(statSync(`${dir}.gbrain-owner.json`).mtimeMs).toBe(before.mtimeMs);
+      // Live PID reuse in diagnostic kernel metadata must not block native ownership.
+      if (phase === 'metadata-renamed') {
+        const path = join(dir, '.gbrain-lock', 'lock');
+        const metadata = JSON.parse(readFileSync(path, 'utf8'));
+        writeFileSync(path, JSON.stringify({ ...metadata, pid: process.pid }));
+      }
+      await releaseLock(await acquireLock(dir, { timeoutMs: 1000 }));
+    } finally {
+      if (child.exitCode === null) child.kill('SIGKILL');
+      await child.exited;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15000);
+}
+
+for (const marker of [undefined, '', JSON.stringify({ protocol: 'kernel-v1' })]) {
+  test(`legacy live and unreadable owners stay protected (marker=${marker ?? 'absent'})`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-kernel-test-'));
+    try {
+      for (const content of [JSON.stringify({ pid: process.pid, acquired_at: 1 }), '{broken']) {
+        const dir = join(root, content.startsWith('{broken') ? 'unreadable' : 'live');
+        mkdirSync(join(dir, '.gbrain-lock'), { recursive: true });
+        writeFileSync(join(dir, '.gbrain-lock', 'lock'), content);
+        // A valid marker alone cannot identify an unreadable record as legacy.
+        // Match the established protocol: unreadable metadata after migration
+        // is diagnostic, while unreadable first-migration owners fail closed.
+        if (marker !== undefined) writeFileSync(`${dir}.gbrain-owner.json`, marker);
+        if (content === '{broken' && marker?.includes('kernel-v1')) continue;
+        await expect(acquireLock(dir, { timeoutMs: 50 })).rejects.toThrow(/Timed out/);
+        expect(readFileSync(join(dir, '.gbrain-lock', 'lock'), 'utf8')).toBe(content);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}
