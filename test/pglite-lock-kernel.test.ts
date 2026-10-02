@@ -271,3 +271,69 @@ for (const marker of [undefined, '', JSON.stringify({ protocol: 'kernel-v1' })])
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 }
+
+// Child environments keep configuration probes isolated from the test runner.
+test('batch lock budget waits for a live holder and still fails at its deadline', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gbrain-kernel-test-budget-'));
+  const dir = join(root, 'db');
+  const code = `import { acquireLock, releaseLock } from ${JSON.stringify(join(import.meta.dir, '../src/core/pglite-lock.ts'))};
+    console.log('ready');
+    const started = performance.now();
+    try { const lock = await acquireLock(process.argv[1]);
+      console.log(JSON.stringify({acquired: true, waitedMs: performance.now() - started}));
+      await releaseLock(lock);
+    } catch (error) { console.log(JSON.stringify({acquired: false, waitedMs: performance.now() - started}));
+      console.error(error.message); process.exitCode = 1; }`;
+  const spawnBudget = (budget: string) => Bun.spawn([process.execPath, '-e', code, dir], {
+    env: { ...process.env, GBRAIN_PGLITE_LOCK_TIMEOUT_MS: budget }, stdout: 'pipe', stderr: 'pipe',
+  });
+  const holder = await acquireLock(dir);
+  const children: ReturnType<typeof spawnBudget>[] = [];
+  try {
+    const blocked = spawnBudget('100'); children.push(blocked);
+    expect(await blocked.exited).toBe(1);
+    expect(await new Response(blocked.stderr).text()).toContain('Timed out waiting');
+    const timeout = JSON.parse((await new Response(blocked.stdout).text()).trim().split('\n').at(-1)!);
+    expect(timeout.waitedMs).toBeGreaterThanOrEqual(80);
+    expect(timeout.waitedMs).toBeLessThan(1000);
+    expect(JSON.parse(readFileSync(join(dir, '.gbrain-lock/lock'), 'utf8')).owner_token).toBe(holder.ownerToken);
+    const waiting = spawnBudget('3000'); children.push(waiting);
+    const reader = waiting.stdout.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toContain('ready');
+    await Bun.sleep(250);
+    expect(waiting.exitCode).toBeNull();
+    await releaseLock(holder);
+    let output = '';
+    for (;;) { const part = await reader.read(); if (part.done) break; output += new TextDecoder().decode(part.value); }
+    expect(await waiting.exited).toBe(0);
+    const result = JSON.parse(output.trim());
+    expect(result.acquired).toBe(true);
+    expect(result.waitedMs).toBeGreaterThanOrEqual(200);
+    expect(existsSync(getPgliteKernelLockPath(dir)!)).toBe(true);
+  } finally {
+    await releaseLock(holder);
+    await Promise.all(children.map(child => child.exited));
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 10000);
+
+test('invalid batch budgets fail closed and explicit timeout takes precedence', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gbrain-kernel-test-budget-validation-'));
+  const dir = join(root, 'db');
+  const modulePath = JSON.stringify(join(import.meta.dir, '../src/core/pglite-lock.ts'));
+  try {
+    for (const budget of ['', '-1', '1.5', 'NaN', 'Infinity', '2147483648']) {
+      const child = Bun.spawn([process.execPath, '-e', `import {acquireLock} from ${modulePath}; await acquireLock(process.argv[1]);`, dir], {
+        env: { ...process.env, GBRAIN_PGLITE_LOCK_TIMEOUT_MS: budget }, stdout: 'ignore', stderr: 'pipe',
+      });
+      expect(await child.exited).not.toBe(0);
+      expect(await new Response(child.stderr).text()).toContain('Invalid');
+    }
+    expect(existsSync(getPgliteKernelLockPath(dir)!)).toBe(false);
+    const child = Bun.spawn([process.execPath, '-e', `import {acquireLock,releaseLock} from ${modulePath}; await releaseLock(await acquireLock(process.argv[1], {timeoutMs: 100}));`, dir], {
+      env: { ...process.env, GBRAIN_PGLITE_LOCK_TIMEOUT_MS: 'invalid' }, stdout: 'ignore', stderr: 'pipe',
+    });
+    expect(await child.exited).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

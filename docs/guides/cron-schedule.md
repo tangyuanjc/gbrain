@@ -48,6 +48,17 @@ fixed. You wake up and the brain is smarter than when you went to sleep.
 0 2 * * * /path/to/dream-cycle.sh
 ```
 
+### PGLite contention budget
+
+Persistent PGLite permits one database owner at a time. Interactive commands
+wait 30 seconds by default. Batch schedules sharing the brain with imports can
+set `GBRAIN_PGLITE_LOCK_TIMEOUT_MS=300000` in the job environment to wait up to
+five minutes, including embedding reconnects. The value must be integer
+milliseconds from 0 through 2147483647; invalid values fail before taking a lock.
+An explicit API `timeoutMs` overrides the environment. This changes only the
+acquisition wait: the job still errors at its deadline and never steals a live
+owner's lock. Keep the budget below the scheduler's overall execution allowance.
+
 ### Quiet Hours Gate (MANDATORY)
 
 Every cron job that sends notifications MUST check quiet hours first.

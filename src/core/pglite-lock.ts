@@ -172,7 +172,13 @@ function busy(lockDir: string): PgliteBusyError {
  */
 export async function acquireLock(dataDir: string | undefined, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<LockHandle> {
   if (!dataDir) return { lockDir: '', acquired: true };
-  const timeoutMs = opts.timeoutMs ?? 30_000;
+  // Batch schedules can wait through normal imports without changing the
+  // interactive default or weakening kernel ownership. Explicit callers win.
+  const configured = process.env.GBRAIN_PGLITE_LOCK_TIMEOUT_MS;
+  if (opts.timeoutMs === undefined && configured !== undefined && !/^\d+$/.test(configured)) {
+    throw new RangeError('Invalid GBRAIN_PGLITE_LOCK_TIMEOUT_MS; expected integer milliseconds');
+  }
+  const timeoutMs = opts.timeoutMs ?? (configured === undefined ? 30_000 : Number(configured));
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 2 ** 31 - 1) throw new RangeError('Invalid PGLite lock timeout');
   const canonical = canonicalPath(dataDir);
   const kernelPath = getPgliteKernelLockPath(canonical)!;
